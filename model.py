@@ -13,6 +13,9 @@ from collections import defaultdict
 
 from isa import Instr, Reg
 
+branch_instrs=[]
+branch_miss_list =[]
+
 EventKind = Enum('EventKind', [
     'WAW', 'WAR', 'RAW',
     'BMISS', 'BHIT',
@@ -217,27 +220,42 @@ class Bht:
         valid: bool = False
         sat_counter: int = 0
 
-    def __init__(self, entries=128):
+    def __init__(self, entries=128, bht_log=False):
         self.contents = [Bht.Entry() for _ in range(entries)]
+        self.bht_log = bht_log
 
-    def predict(self, addr):
+    def predict(self, addr, instr_to_pred):
         "Is the branch taken? None if don't know"
         entry = self.contents[self._index(addr)]
         if entry.valid:
+            if self.bht_log:
+                print (f"predicting : {instr_to_pred.line} -> taken?: {entry.sat_counter >= 2}")
             return entry.sat_counter >= 2
         return None
 
-    def resolve(self, addr, taken):
+    def resolve(self, addr, last_instr, taken):
         "Update branch prediction"
         index = self._index(addr)
         entry = self.contents[index]
         entry.valid = True
+        last_miss = None
+        if self.bht_log:
+            print (f"sat_counter value before resolve: {entry.sat_counter}")
+
         if taken:
             if entry.sat_counter < 3:
                 entry.sat_counter += 1
         else:
             if entry.sat_counter > 0:
                 entry.sat_counter -= 1
+         
+        if last_instr.line in branch_miss_list:
+            last_miss = True
+        elif last_instr.line in branch_instrs:
+            last_miss = False
+        if self.bht_log:
+            print(f"bht -> resolved\t|\t addr= {addr:x}\t|\t addr_bin= {addr:<35b}\t|\t index= {index:08b}\t|\t taken= {taken}\t|\t sat_counter={entry.sat_counter}\t|\t branch_misspredicted= {last_miss}")
+            print (f"___BHT_INFO___ instr_info: {last_instr.line}\t|\t branch_misspredicted= {last_miss}")
 
     def _index(self, addr):
         return (addr >> 1) % len(self.contents)
@@ -349,9 +367,10 @@ class Model:
             sb_len=8,
             fetch_size=None,
             has_forwarding=True,
-            has_renaming=True):
+            has_renaming=True,
+            BP_log=False):
         self.ras = Ras(debug=debug)
-        self.bht = Bht()
+        self.bht = Bht(128, bht_log = BP_log)
         self.instr_queue = []
         self.scoreboard = []
         self.fus = FusBusy(issue > 1)
@@ -366,6 +385,7 @@ class Model:
         self.has_forwarding = has_forwarding
         self.has_renaming = has_renaming
         self.log = []
+        self.BP_log = BP_log
 
     def log_event_on(self, instr, kind, cycle):
         """Log an event on the instruction"""
@@ -377,7 +397,7 @@ class Model:
 
     def predict_branch(self, instr):
         """Predict if branch is taken or not"""
-        pred = self.bht.predict(instr.address)
+        pred = self.bht.predict(instr.address, instr)
         if pred is not None:
             return pred
         return instr.offset() >> 31 != 0
@@ -418,11 +438,29 @@ class Model:
 
     def commit_manage_last_branch(self, instr, cycle):
         "Resolve branch prediction"
+        branch_miss = None
         if self.last_committed is not None:
             last = self.last_committed
             if last.is_branch():
                 taken = instr.address != last.next_addr()
-                self.bht.resolve(last.address, taken)
+                branch_miss = taken != (self.bht.predict(last.address, last) or False)
+            
+                # Log branch miss after resolution
+                if branch_miss:
+                    branch_miss_list.append(last.line)
+                    if self.BP_log:
+                        print(f"Branch Miss Logged: \t\t line: {last.line}, address: {last.address:#x}, "
+                            f"hex_code: {last.hex_code}, mnemo: {last.mnemo}, taken: {taken}")
+                else:
+                    if self.BP_log:
+                        print(f"Branch Hit Logged: \t\t line: {last.line}, address: {last.address:#x}, "
+                            f"hex_code: {last.hex_code}, mnemo: {last.mnemo}, taken: {taken}")
+
+                branch_instrs.append(last.line)
+                if self.BP_log:
+                    print(f"Branch Logged: \t\t line: {last.line}, address: {last.address:#x}, "
+                            f"hex_code: {last.hex_code}, mnemo: {last.mnemo}, taken: {taken}")
+                self.bht.resolve(last.address, last, taken)
         self.last_committed = instr
 
     def find_data_hazards(self, instr, cycle):
@@ -474,7 +512,9 @@ class Model:
             entry.cycles_since_issue += 1
             instr = entry.instr
             duration = 1
-            if instr.is_load() or instr.is_store():
+            if instr.is_load():
+                duration = 3
+            if instr.is_store():
                 duration = 2
             if instr.is_muldiv():
                 duration = 2
@@ -612,7 +652,7 @@ def issue_commit_graph(input_file, n = 3):
 def filter_timed_part(all_instructions):
     "Keep only timed part from a trace"
     filtered = []
-    re_csrr_minstret = re.compile(r"^csrr\s+\w\w,\s*minstret$")
+    re_csrr_minstret = re.compile(r"^csrr\s+\w\w,\s*instret$")
     accepting = False
     for instr in all_instructions:
         if re_csrr_minstret.search(instr.mnemo):
@@ -642,16 +682,62 @@ def print_stats(instructions):
     print_data("instruction number", n_instr)
     for ek, count in ecount.items():
         print_data(f"{ek}/instr", f"{100 * count / n_instr:.2f}%")
+def count_unique_entries(all_instructions,lines,print_addresses = False):
+    re_csrr_minstret = re.compile(r"^csrr\s+\w\w,\s*instret$")
+    start_end_addr=[]
+    for instr in all_instructions:
+        if re_csrr_minstret.search(instr.mnemo):
+            start_end_index = instr.line.find('@')
+            if start_end_index !=-1:
+                start_end_addr.append(int(instr.line[start_end_index + 1:].split()[0]))
+            # print(instr.line)
+            continue
+    if print_addresses:
+        print(f"start ={start_end_addr[0]},end ={start_end_addr[1]}")
+
+    entries_count = 0
+    entries_count_main = 0
+    branches_in_main=[]
+    line_previous = None
+
+    for line in lines:
+        # Find the "@" symbol and extract the number after it
+        at_index = line.find('@')
+        if at_index != -1:
+            number = int(line[at_index + 1:].split()[0])
+            
+            if line_previous!=line:
+                if number > start_end_addr[0] and number < start_end_addr[1]:
+                    entries_count_main += 1
+                    branches_in_main.append(line)
+                entries_count += 1
+                line_previous=line
+    # save_branch_insts(branches_in_main,"branches_in_main")
+    return entries_count, entries_count_main
+
+def save_branch_insts(my_list,file_name):
+    with open(file_name, "w") as file:
+        # Write each element to a new line
+        for element in my_list:
+            file.write(f"{element}\n")
 
 def main(input_file: str):
     "Entry point"
 
-    model = Model(debug=True, issue=2, commit=2)
+    model = Model(debug=False, issue=2, commit=2, BP_log = False)
     model.load_file(input_file)
     model.run()
 
     write_trace('annotated.log', model.retired)
-    print_stats(filter_timed_part(model.retired))
+    # print_stats(filter_timed_part(model.retired))
+    _ , branch_cnt_main = count_unique_entries(model.retired,branch_instrs)
+    print(f"branch count in main ={branch_cnt_main}")
+    _ , bmiss_cnt_main = count_unique_entries(model.retired,branch_miss_list)
+    print(f"branch miss ={bmiss_cnt_main}")
+
+    if False: #change to True to save the branch list and the list of missed branches
+        save_branch_insts(branch_instrs,"branches_list")
+        save_branch_insts(branch_miss_list, "branch_miss_list")
 
 if __name__ == "__main__":
     main(sys.argv[1])
