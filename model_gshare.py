@@ -683,7 +683,7 @@ def display_scores(scores):
         dz.append(bz)
 
     #fig = plt.figure()
-    #ax1 = fig.add_subplot(111, projection='3d')
+    #ax1 = fig.add_subplot(111, projection='3d')if 
     #ax1.bar3d(x, y, z, dx, dy, dz)
     #ax1.set_xlabel("issue")
     #ax1.set_ylabel("commit")
@@ -743,6 +743,8 @@ def print_stats(instructions):
     print_data("cycle number", n_cycles)
     print_data("Coremark/MHz", 1000000 / n_cycles)
     print_data("instruction number", n_instr)
+    for ek, count in ecount.items():
+        print_data(f"{ek}/instr", f"{100 * count / n_instr:.2f}%")
     
 
 
@@ -759,8 +761,6 @@ def count_unique_entries(all_instructions,lines,print_addresses = False):
     if print_addresses:
         print(f"start ={start_end_addr[0]},end ={start_end_addr[1]}")
 
-    # previous_number = None
-    # isntr_name_previous = None
     entery_cnt = 0
     entery_cnt_main = 0
     branches_in_main=[]
@@ -771,18 +771,12 @@ def count_unique_entries(all_instructions,lines,print_addresses = False):
         at_index = line.find('@')
         if at_index != -1:
             number = int(line[at_index + 1:].split()[0])
-            # isntr_name = line[at_index + 1:].split()[1:]
-            # number = int(number_str)
 
-            # If this number is different from the previous one, increment the unique count
-            # if number != previous_number or (isntr_name!=isntr_name_previous): 
             if line_previous!=line:
                 if number > start_end_addr[0] and number < start_end_addr[1]:
                     entery_cnt_main += 1
                     branches_in_main.append(line)
                 entery_cnt += 1
-                # previous_number = number  # Update the previous number
-                # isntr_name_previous = isntr_name
                 line_previous=line
     # save_branch_insts(branches_in_main,"branches_in_main")
     return entery_cnt, entery_cnt_main
@@ -804,13 +798,14 @@ def main(input_file: str, gshare_enteries: str,
 
     write_trace('annotated.log', model.retired)
     # print_stats(filter_timed_part(model.retired))     #original satats that we do not use! Because we don't use COREMark benchmarks.
-    entery_cnt1, entery_cnt_main1 = count_unique_entries(model.retired,branch_instrs)
-    print(f"branch_count= {entery_cnt_main1}")
-    bmiss_cnt, bmiss_cnt_main = count_unique_entries(model.retired,branch_miss_list)
-    print(f"branch_miss= {bmiss_cnt_main}")
-
-    save_branch_insts(branch_instrs,"branches_list")
-    save_branch_insts(branch_miss_list, "branch_miss_list")
+    _ , branch_cnt_main = count_unique_entries(model.retired,branch_instrs)
+    print(f"branch count in main ={branch_cnt_main}")
+    _ , bmiss_cnt_main = count_unique_entries(model.retired,branch_miss_list)
+    print(f"branch miss ={bmiss_cnt_main}")
+    
+    if False: #change to True to save the branch list and the list of missed branches
+        save_branch_insts(branch_instrs,"branches_list")
+        save_branch_insts(branch_miss_list, "branch_miss_list")
 
 if __name__ == "__main__":
     main(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4])
