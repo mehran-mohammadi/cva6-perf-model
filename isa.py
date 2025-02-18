@@ -473,6 +473,7 @@ class Instr:
     def __init__(self, bincode):
         self.bin = bincode
         self.inst_1_0 = self.bin & 3
+        self.prediction = None  # Default to None (unknown prediction)
 
     def base(self):
         """Get the name of the base instruction"""

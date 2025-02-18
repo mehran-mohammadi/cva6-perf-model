@@ -13,9 +13,9 @@ from collections import defaultdict
 
 from isa import Instr, Reg
 
-branch_instrs=[]
+branch_instrs =[]
 branch_miss_list =[]
-branch_miss = 0
+branch_miss_cnt = 0
 
 EventKind = Enum('EventKind', [
     'WAW', 'WAR', 'RAW',
@@ -106,6 +106,7 @@ class IqLen:
         self.debug = debug
         self.len = self.fetch_size
         self.new_fetch = True
+        self.flush_preds = False
 
     def fetch(self):
         """Fetch bytes"""
@@ -118,7 +119,7 @@ class IqLen:
         self.len = 0
         self._debug(f"flushed, got {self.len}")
         self.new_fetch = False
-
+        self.flush_preds = True
     def jump(self):
         """Loose a fetch cycle and truncate (jump, branch hit taken)"""
         if self.new_fetch:
@@ -312,8 +313,6 @@ class GShare:
         "Calculate index by XORing the address with GHR"
         addr_index = addr >> self.addr_shift  # Optionally shift address if needed
         ghr_mult = int(len(self.contents)/(2**self.history_bits)) #replicating the shift of ghr
-        if self.gshare_log:
-            print(f"ghr_shift ={ghr_mult}")
         return (addr_index ^ (self.ghr*ghr_mult) ) % len(self.contents)
 
 Fu = Enum('Fu', ['ALU', 'MUL', 'BRANCH', 'LDU', 'STU'])
@@ -472,7 +471,7 @@ class Model:
     def predict_pc(self, last):
         """Predict next program counter depending on last issued instruction"""
         if last.is_branch():
-            taken = self.predict_branch(last)
+            taken = last.prediction # changed from:  taken = self.predict_branch(last)
             offset = to_signed(last.offset()) if taken else last.size()
             return last.address + offset
         if last.is_regjump():
@@ -488,8 +487,36 @@ class Model:
             if pred is not None:
                 bmiss = pred != instr.address
                 resolved = cycle >= self.last_issued.issue_cycle + 6
+                local_debug_flag = False
                 if bmiss and not resolved:
                     self.iqlen.flush()
+                    if local_debug_flag:
+                        print(f"FLUSH! the isntruction causing it: {last.address:x}")
+
+
+                    #Flush of predictions
+                    
+                    if self.iqlen.flush_preds:
+                        k=0
+                        
+                        while(True): #go through next instructions untill no prediction available.
+                            if len(self.instr_queue)<=k: #avoiding list index out of range error 
+                                break
+                            if local_debug_flag:
+                                print(f"flush debug {self.instr_queue[k].address:x}  \t|\t with k={k}")
+                            if self.instr_queue[k].is_branch():
+                                if self.instr_queue[k].prediction== None:
+                                    if local_debug_flag:
+                                        print(f"flush debug: ended {self.instr_queue[k].address:x} prediction ={self.instr_queue[k].prediction}")
+                                    break 
+                                self.instr_queue[k].prediction = None
+                                if False:
+                                    print(f"prediction for {self.instr_queue[k].address:x} flushed \t|\t with k={k}")
+                                    
+                            k+=1
+                        self.iqlen.flush_preds = False
+
+
                 branch = EventKind.BMISS if bmiss else EventKind.BHIT
                 if branch not in [e.kind for e in instr.events]:
                     
@@ -498,14 +525,24 @@ class Model:
                     if taken and not bmiss:
                         # last (not instr) was like a jump
                         self.iqlen.jump()
+                    self.branch_resolve_issueStage(instr, cycle) # added by mehran
 
-    def commit_manage_last_branch(self, instr, cycle):
+    def branch_resolve_issueStage(self, instr, cycle):
         "Resolve branch prediction"
-        if self.last_committed is not None:
-            last = self.last_committed
+        if self.last_issued is not None:
+            last = self.last_issued.instr
             if last.is_branch():
                 taken = instr.address != last.next_addr()
-                branch_miss = taken != (self.gshare.predict(last.address, last) or False)
+
+                gshare_pred = last.prediction
+                # if last.address==0x20005be0: #or last.address == 0x20002026: # or last.address==0x20005bb4 or last.address==0x20003130
+                #     gshare_pred = self.predict_branch(last)
+                    # print (f"prediction for branch 0x20005bb4 changed...")
+                
+        
+                branch_miss = taken != gshare_pred#(self.gshare.predict(last.address, last))
+                if self.BP_log:
+                    print (f"____Logging branches: gshare_pred= {gshare_pred}\t\t branchmiss= {branch_miss}")
             
                 # Log branch miss after resolution
                 if branch_miss:
@@ -522,8 +559,45 @@ class Model:
                     print(f"Branch Logged: \t\t line: {last.line}, address: {last.address:#x}, "
                             f"hex_code: {last.hex_code}, mnemo: {last.mnemo}, taken: {taken}")
                 
-                #self.bht.resolve(last.address, taken)
+                ghr_q = self.gshare.ghr
                 self.gshare.resolve(last.line, last.address, last, taken)
+                #rtl_like logs
+                print(f"# Resolve-> ghr_d = {self.gshare.ghr:04b} \t|\t ghr_q = {ghr_q:04b} \t|\t updater address: {last.address:#x} \t|\t taken: {taken:01b} \t|\t is mispred: {int(branch_miss):01b}")# \t|\t prediction: {int(gshare_pred):01b}")
+                
+        self.last_committed = instr
+
+    def commit_manage_last_branch(self, instr, cycle): # NOT using this function anymore!
+        "Resolve branch prediction"
+        if self.last_committed is not None:
+            last = self.last_committed
+            if last.is_branch():
+                taken = instr.address != last.next_addr()
+
+                gshare_pred = last.prediction
+                
+                branch_miss = taken != gshare_pred#(self.gshare.predict(last.address, last))
+                if self.BP_log:
+                    print (f"____Logging branches: gshare_pred= {gshare_pred}\t\t branchmiss= {branch_miss}")
+            
+                # Log branch miss after resolution
+                if branch_miss:
+                    branch_miss_list.append(last.line)
+                    if self.BP_log:
+                        print(f"Branch Miss Logged: \t\t line: {last.line}, address: {last.address:#x}, "
+                            f"hex_code: {last.hex_code}, mnemo: {last.mnemo}, taken: {taken}")
+                else:
+                    if self.BP_log:
+                        print(f"Branch Hit Logged: \t\t line: {last.line}, address: {last.address:#x}, "
+                            f"hex_code: {last.hex_code}, mnemo: {last.mnemo}, taken: {taken}")
+                branch_instrs.append(last.line)
+                if self.BP_log:
+                    print(f"Branch Logged: \t\t line: {last.line}, address: {last.address:#x}, "
+                            f"hex_code: {last.hex_code}, mnemo: {last.mnemo}, taken: {taken}")
+                
+                ghr_q = self.gshare.ghr
+                self.gshare.resolve(last.line, last.address, last, taken)
+                print(f"# Resolve-> ghr_d = {self.gshare.ghr:04b} \t|\t ghr_q = {ghr_q:04b} \t|\t updater address: {last.address:#x} \t|\t taken: {taken:01b} \t|\t is mispred: {int(branch_miss):01b}")# \t|\t prediction: {int(gshare_pred):01b}")
+                
         self.last_committed = instr
 
     def find_data_hazards(self, instr, cycle):
@@ -600,17 +674,96 @@ class Model:
             instr = self.scoreboard.pop(0).instr
             self.log_event_on(instr, EventKind.commit, cycle)
             self.retired.append(instr)
-            self.commit_manage_last_branch(instr, cycle)
+            # self.commit_manage_last_branch(instr, cycle)
 
     def run_cycle(self, cycle):
         """Runs a cycle"""
+        local_debug_flag = False
+
+        if local_debug_flag:
+            print (f"-------Cycle = {cycle}---------")
+        
         self.fus.cycle()
         for commit_port in range(self.commit_width):
             self.try_commit(cycle, commit_port)
         self.try_execute(cycle)
         for _ in range(self.issue_width):
             self.try_issue(cycle)
-        self.iqlen.fetch()
+        
+        instr_len_sum=0
+        i=0
+        len_thr = 32+self.iqlen.fetch_size
+        
+        #Finding the length of instructions to replicate FIFOs in rtl
+        while(True):
+            if len(self.instr_queue) <= i: #avoiding list index out of range error 
+                break
+
+            next_instr = self.instr_queue[i]
+
+            instr_len_sum += next_instr.size()
+            if next_instr.is_compressed():
+                len_thr -=2
+            i+=1
+            if instr_len_sum > len_thr:
+                if local_debug_flag:
+                    print (f"Len_thr found ->  {len_thr} \t|\t instr_len_sum= {instr_len_sum} \t|\t with i= {i}")
+                break
+
+        instr_queue_full = len_thr < (self.iqlen.len)#+self.iqlen.fetch_size)
+        if local_debug_flag:
+            print (f"Instr queue full? ->  {instr_queue_full} Iqlen.len: {self.iqlen.len}")
+        if not instr_queue_full:
+            self.iqlen.fetch()
+            
+            j=0
+            instr_len_sum_new = 0
+            breakflag=False
+            if len(self.instr_queue) > 16:
+                while(True):
+                    next_instr = self.instr_queue[j]
+                    instr_len_sum_new += next_instr.size()
+                    modulo = instr_len_sum_new - self.iqlen.len
+                    if modulo ==0: 
+                        breakflag=True
+                        if local_debug_flag:
+                            print(f"Predict Break (next cycle) ->  Instr address: {next_instr.address:#x}\t|\t j = {j}\t|\t modulo = {modulo}\t|\t compressed: {next_instr.is_compressed()}\t|\t iqlen.len= {self.iqlen.len}")
+                        # break
+                    elif modulo==2 : 
+                        if next_instr.is_compressed():
+                            if local_debug_flag:
+                                print(f"Predict Break -> Break now(compressed)! Instr address: {next_instr.address:#x}\t|\t j = {j}\t|\t modulo = {modulo}\t|\t compressed: {next_instr.is_compressed()}")
+                            # break
+                            breakflag=True
+                        else: # crossword instruction! -> break in next isntruction.
+                            if local_debug_flag:
+                                print(f"Predict Break -> Crossword(next cycle)! Instr address: {next_instr.address:#x}\t|\t j = {j}\t|\t modulo = {modulo}\t|\t compressed: {next_instr.is_compressed()}")
+                            breakflag=True
+                    elif modulo>2: 
+                        if local_debug_flag:
+                            print(f"Predict Break -> Break now! Instr address: {next_instr.address:#x}\t|\t j = {j}\t|\t modulo = {modulo}\t|\t compressed: {next_instr.is_compressed()}")
+                        break
+
+                    if next_instr.is_branch() and next_instr.prediction == None:
+                        if self.iqlen.has(next_instr):
+                            taken = self.predict_branch(next_instr)
+                            next_instr.prediction = taken
+
+                            if local_debug_flag:
+                                print(f"branch prediction for branch: {next_instr.address:#x} extracted: {taken} ghr: {self.gshare.ghr:04b} j={j}")
+                    
+                        elif self.iqlen._is_crossword(next_instr):
+                            taken = self.predict_branch(next_instr)
+                            next_instr.prediction = taken
+
+                            if local_debug_flag:
+                                print (f"crossword detected! ->  {next_instr.address:#x}")
+                    if breakflag :
+                        breakflag = False
+                        break
+                    j+=1
+
+        
 
     def load_file(self, path):
         """Fill a model from a trace file"""
@@ -792,18 +945,17 @@ def main(input_file: str, gshare_enteries: str,
             gshare_addr_shift: str):
     "Entry point"
 
-    model = Model(debug=False, issue=2, commit=2,gshare_enteries=int(gshare_enteries), gshare_ghrwidth=int(gshare_ghrwidth), gshare_addr_shift=int(gshare_addr_shift), BP_log = False)
+    model = Model(debug=False, issue=2, has_renaming=True, commit=2,gshare_enteries=int(gshare_enteries), gshare_ghrwidth=int(gshare_ghrwidth), gshare_addr_shift=int(gshare_addr_shift), BP_log =False)
     model.load_file(input_file)
     model.run()
 
     write_trace('annotated.log', model.retired)
     # print_stats(filter_timed_part(model.retired))     #original satats that we do not use! Because we don't use COREMark benchmarks.
-    _ , branch_cnt_main = count_unique_entries(model.retired,branch_instrs)
-    print(f"branch count in main ={branch_cnt_main}")
-    _ , bmiss_cnt_main = count_unique_entries(model.retired,branch_miss_list)
-    print(f"branch miss ={bmiss_cnt_main}")
-    
-    if False: #change to True to save the branch list and the list of missed branches
+    branch_cnt_tot , branch_cnt_main = count_unique_entries(model.retired,branch_instrs)
+    print(f"branch count in main ={branch_cnt_main}, total: {branch_cnt_tot}")
+    branch_miss_tot , bmiss_cnt_main = count_unique_entries(model.retired,branch_miss_list)
+    print(f"branch miss ={bmiss_cnt_main}, branch miss tot : {branch_miss_tot}")
+    if True: #change to True to save the branch list agnd the list of missed branches
         save_branch_insts(branch_instrs,"branches_list")
         save_branch_insts(branch_miss_list, "branch_miss_list")
 
